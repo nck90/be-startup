@@ -1,4 +1,4 @@
-import { useMemo, useState } from 'react'
+import { useEffect, useMemo, useState } from 'react'
 import './App.css'
 
 type FounderType = 'builder' | 'sales' | 'planner' | 'fundraiser'
@@ -99,7 +99,25 @@ type ChecklistItem = {
   done: boolean
 }
 
+type RankingEntry = {
+  id: string
+  companyName: string
+  score: number
+  grade: string
+  endingTitle: string
+  difficulty: Difficulty
+  strategy: Strategy
+  completedMonths: number
+  runway: number
+  capital: number
+  validation: number
+  investment: number
+  createdAt: string
+}
+
 const STORAGE_KEY = 'be-startup-save'
+const RANKING_STORAGE_KEY = 'be-startup-rankings'
+const MAX_RANKINGS = 10
 
 const founderTypes: Record<FounderType, { label: string; bonus: string; effect: Partial<Record<MetricKey, number>> }> = {
   builder: { label: '개발형 대표', bonus: '제품 완성도 +10', effect: { product: 10 } },
@@ -690,6 +708,110 @@ function getFounderScore(state: GameState) {
   return { score, grade: 'D', label: '재설계가 필요한 팀' }
 }
 
+function hashString(value: string) {
+  let hash = 0
+  for (let index = 0; index < value.length; index += 1) {
+    hash = (hash * 31 + value.charCodeAt(index)) | 0
+  }
+  return Math.abs(hash).toString(36)
+}
+
+function rankingFingerprint(state: GameState) {
+  const founderScore = getFounderScore(state)
+  const metricSnapshot = (Object.entries(state.metrics) as [MetricKey, number][])
+    .map(([key, value]) => `${key}:${value}`)
+    .join('|')
+  const decisionPath = state.history.map((item) => `${item.month}:${item.title}`).join('>')
+  return hashString(
+    [
+      state.company.name,
+      state.company.problem,
+      state.company.customer,
+      state.company.category,
+      state.company.founderType,
+      state.company.difficulty,
+      state.company.strategy,
+      state.month,
+      state.capital,
+      state.burn,
+      founderScore.score,
+      metricSnapshot,
+      decisionPath,
+    ].join('::'),
+  )
+}
+
+function sanitizeRankings(value: unknown): RankingEntry[] {
+  if (!Array.isArray(value)) return []
+
+  return value
+    .filter((item): item is RankingEntry => {
+      if (!item || typeof item !== 'object') return false
+      const entry = item as Partial<RankingEntry>
+      return (
+        typeof entry.id === 'string' &&
+        typeof entry.companyName === 'string' &&
+        typeof entry.score === 'number' &&
+        typeof entry.grade === 'string' &&
+        typeof entry.endingTitle === 'string' &&
+        typeof entry.difficulty === 'string' &&
+        entry.difficulty in difficultySettings &&
+        typeof entry.strategy === 'string' &&
+        entry.strategy in strategySettings &&
+        typeof entry.completedMonths === 'number' &&
+        typeof entry.runway === 'number' &&
+        typeof entry.capital === 'number' &&
+        typeof entry.validation === 'number' &&
+        typeof entry.investment === 'number' &&
+        typeof entry.createdAt === 'string'
+      )
+    })
+    .slice(0, MAX_RANKINGS)
+}
+
+function sortRankings(rankings: RankingEntry[]) {
+  return [...rankings].sort((a, b) => {
+    if (b.score !== a.score) return b.score - a.score
+    if (b.runway !== a.runway) return b.runway - a.runway
+    if (b.capital !== a.capital) return b.capital - a.capital
+    return new Date(b.createdAt).getTime() - new Date(a.createdAt).getTime()
+  })
+}
+
+function loadRankings() {
+  try {
+    return sortRankings(sanitizeRankings(JSON.parse(localStorage.getItem(RANKING_STORAGE_KEY) || '[]')))
+  } catch {
+    return []
+  }
+}
+
+function createRankingEntry(state: GameState): RankingEntry {
+  const founderScore = getFounderScore(state)
+  const ending = getEnding(state)
+  return {
+    id: rankingFingerprint(state),
+    companyName: state.company.name,
+    score: founderScore.score,
+    grade: founderScore.grade,
+    endingTitle: ending.title,
+    difficulty: state.company.difficulty,
+    strategy: state.company.strategy,
+    completedMonths: Math.min(state.history.length, chapters.length),
+    runway: getRunway(state.capital, state.burn),
+    capital: state.capital,
+    validation: state.metrics.validation,
+    investment: state.metrics.investment,
+    createdAt: new Date().toISOString(),
+  }
+}
+
+function mergeRanking(rankings: RankingEntry[], state: GameState) {
+  const entry = createRankingEntry(state)
+  if (rankings.some((item) => item.id === entry.id)) return rankings
+  return sortRankings([entry, ...rankings]).slice(0, MAX_RANKINGS)
+}
+
 function getAchievements(state: GameState): Achievement[] {
   const runway = getRunway(state.capital, state.burn)
 
@@ -1089,7 +1211,64 @@ function Dashboard({ state }: { state: GameState }) {
   )
 }
 
-function StartScreen({ onCreate, onContinue }: { onCreate: () => void; onContinue: () => void }) {
+function RankingBoard({
+  rankings,
+  currentId = '',
+  compact = false,
+}: {
+  rankings: RankingEntry[]
+  currentId?: string
+  compact?: boolean
+}) {
+  const visibleRankings = rankings.slice(0, compact ? 5 : MAX_RANKINGS)
+
+  return (
+    <section className={`rankingBoard ${compact ? 'compact' : ''}`} aria-label="로컬 랭킹">
+      <div className="rankingHeader">
+        <div>
+          <p className="eyebrow">Local Ranking</p>
+          <h2>브라우저 랭킹</h2>
+        </div>
+        <span>TOP {visibleRankings.length || 0}</span>
+      </div>
+      {visibleRankings.length > 0 ? (
+        <ol className="rankingList">
+          {visibleRankings.map((entry, index) => (
+            <li className={entry.id === currentId ? 'current' : ''} key={entry.id}>
+              <strong>{index + 1}</strong>
+              <div>
+                <span>{entry.companyName}</span>
+                <p>
+                  {entry.score}점 · {entry.grade}등급 · {entry.endingTitle}
+                </p>
+                <em>
+                  {difficultySettings[entry.difficulty].label} · {strategySettings[entry.strategy].label} ·
+                  런웨이 {entry.runway.toFixed(1)}개월
+                </em>
+              </div>
+              <b>{formatMoney(entry.capital)}</b>
+            </li>
+          ))}
+        </ol>
+      ) : (
+        <div className="emptyRanking">
+          <strong>아직 저장된 기록이 없습니다</strong>
+          <p>엔딩에 도달하면 최종 점수가 이 브라우저에 자동 저장됩니다.</p>
+        </div>
+      )}
+    </section>
+  )
+}
+
+function StartScreen({
+  onCreate,
+  onContinue,
+  rankings,
+}: {
+  onCreate: () => void
+  onContinue: () => void
+  rankings: RankingEntry[]
+}) {
   const hasSave = Boolean(localStorage.getItem(STORAGE_KEY))
 
   return (
@@ -1109,11 +1288,14 @@ function StartScreen({ onCreate, onContinue }: { onCreate: () => void; onContinu
         </div>
         <StartupBackground />
       </section>
-      <section className="featureStrip" aria-label="게임 핵심 요소">
-        <div><strong>8개월</strong><span>월별 의사결정</span></div>
-        <div><strong>9개 지표</strong><span>런웨이와 성장 관리</span></div>
-        <div><strong>다중 엔딩</strong><span>선택에 따른 결과</span></div>
-      </section>
+      <div className="startBottomGrid">
+        <section className="featureStrip" aria-label="게임 핵심 요소">
+          <div><strong>8개월</strong><span>월별 의사결정</span></div>
+          <div><strong>9개 지표</strong><span>런웨이와 성장 관리</span></div>
+          <div><strong>다중 엔딩</strong><span>선택에 따른 결과</span></div>
+        </section>
+        <RankingBoard compact rankings={rankings} />
+      </div>
     </main>
   )
 }
@@ -1389,7 +1571,15 @@ function ResultScreen({ state, result, onNext }: { state: GameState; result: Res
   )
 }
 
-function EndingScreen({ state, onRestart }: { state: GameState; onRestart: () => void }) {
+function EndingScreen({
+  state,
+  onRestart,
+  rankings,
+}: {
+  state: GameState
+  onRestart: () => void
+  rankings: RankingEntry[]
+}) {
   const ending = getEnding(state)
   const runway = getRunway(state.capital, state.burn)
   const founderScore = getFounderScore(state)
@@ -1407,6 +1597,7 @@ function EndingScreen({ state, onRestart }: { state: GameState; onRestart: () =>
     .sort((a, b) => b[1] - a[1])[0]
   const weakMetric = (Object.entries(state.metrics) as [MetricKey, number][])
     .sort((a, b) => a[1] - b[1])[0]
+  const currentRankingId = rankingFingerprint(state)
 
   return (
     <main className="endingScreen">
@@ -1474,6 +1665,7 @@ function EndingScreen({ state, onRestart }: { state: GameState; onRestart: () =>
             ))}
           </div>
         )}
+        <RankingBoard rankings={rankings} currentId={currentRankingId} />
         <button className="primaryButton" type="button" onClick={onRestart}>다시 창업하기</button>
       </section>
     </main>
@@ -1575,29 +1767,56 @@ function App() {
   const [screen, setScreen] = useState<Screen>('start')
   const [state, setState] = useState<GameState | null>(null)
   const [lastResult, setLastResult] = useState<Result | null>(null)
+  const [rankings, setRankings] = useState<RankingEntry[]>([])
 
   const isGameOver = useMemo(() => {
     if (!state) return false
     return state.capital <= 0 || state.month > chapters.length
   }, [state])
 
-  function persist(nextState: GameState) {
-    localStorage.setItem(STORAGE_KEY, JSON.stringify(nextState))
-  }
+  useEffect(() => {
+    setRankings(loadRankings())
+  }, [])
+
+  useEffect(() => {
+    if (!state) return
+    try {
+      localStorage.setItem(STORAGE_KEY, JSON.stringify(state))
+    } catch {
+      // localStorage can fail in private mode or when browser quota is full.
+    }
+  }, [state])
+
+  useEffect(() => {
+    if (screen !== 'ending' || !state || !isGameOver) return
+    setRankings((currentRankings) => {
+      const nextRankings = mergeRanking(currentRankings, state)
+      if (nextRankings === currentRankings) return currentRankings
+      try {
+        localStorage.setItem(RANKING_STORAGE_KEY, JSON.stringify(nextRankings))
+      } catch {
+        return currentRankings
+      }
+      return nextRankings
+    })
+  }, [screen, state, isGameOver])
 
   function startGame(company: Company) {
     const nextState = createNewGame(company)
     setState(nextState)
-    persist(nextState)
     setScreen('play')
   }
 
   function continueGame() {
     const rawSave = localStorage.getItem(STORAGE_KEY)
     if (!rawSave) return
-    const nextState = normalizeSave(JSON.parse(rawSave) as GameState)
-    setState(nextState)
-    setScreen(nextState.month > chapters.length || nextState.capital <= 0 ? 'ending' : 'play')
+    try {
+      const nextState = normalizeSave(JSON.parse(rawSave) as GameState)
+      setState(nextState)
+      setScreen(nextState.month > chapters.length || nextState.capital <= 0 ? 'ending' : 'play')
+    } catch {
+      localStorage.removeItem(STORAGE_KEY)
+    }
   }
 
   function restart() {
@@ -1612,7 +1831,6 @@ function App() {
     const { nextState, result } = applyChoice(state, choice)
     setState(nextState)
     setLastResult(result)
-    persist(nextState)
     setScreen('result')
   }
 
@@ -1623,9 +1841,9 @@ function App() {
   if (screen === 'create') return <CreateScreen onStart={startGame} />
   if (screen === 'play' && state) return <PlayScreen state={state} onChoose={choose} onRestart={restart} />
   if (screen === 'result' && state && lastResult) return <ResultScreen state={state} result={lastResult} onNext={nextAfterResult} />
-  if (screen === 'ending' && state) return <EndingScreen state={state} onRestart={restart} />
+  if (screen === 'ending' && state) return <EndingScreen state={state} rankings={rankings} onRestart={restart} />
 
-  return <StartScreen onCreate={() => setScreen('create')} onContinue={continueGame} />
+  return <StartScreen rankings={rankings} onCreate={() => setScreen('create')} onContinue={continueGame} />
 }
 
 export default App
